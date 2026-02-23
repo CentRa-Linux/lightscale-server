@@ -72,12 +72,10 @@ fn map_store_err(err: Error) -> ApiError {
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let header = headers.get(axum::http::header::AUTHORIZATION)?;
     let value = header.to_str().ok()?;
-    let prefix = "Bearer ";
-    if value.starts_with(prefix) {
-        Some(value[prefix.len()..].trim())
-    } else {
-        None
-    }
+    value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 fn require_admin(headers: &HeaderMap, admin_token: &Option<String>) -> Result<(), ApiError> {
@@ -1333,7 +1331,7 @@ fn build_netmap(
             &network.id,
             network.dns_domain.as_str(),
             &state.nodes,
-            Some(&node_id),
+            Some(node_id),
             node,
             &network.acl,
             &network.key_policy,
@@ -1383,6 +1381,7 @@ fn collect_probe_requests(state: &State, peers: &[PeerInfo], now: i64) -> Vec<Pr
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_peers(
     network_id: &str,
     dns_domain: &str,
@@ -1400,7 +1399,7 @@ fn collect_peers(
             let (approved, _) = effective_node_status(node, key_policy, now);
             approved
         })
-        .filter(|node| exclude_id.map_or(true, |id| node.id != id))
+        .filter(|node| exclude_id.is_none_or(|id| node.id != id))
         .filter(|node| acl_allows(acl, src_node, node))
         .map(|node| PeerInfo::from((node, dns_domain)))
         .collect()
@@ -1444,7 +1443,12 @@ fn current_key_created_at(node: &NodeState, key_type: KeyType) -> Option<i64> {
         .map(|record| record.created_at)
 }
 
-fn revoke_key_record(history: &mut Vec<KeyRecord>, key_type: KeyType, public_key: &str, now: i64) {
+fn revoke_key_record(
+    history: &mut [KeyRecord],
+    key_type: KeyType,
+    public_key: &str,
+    now: i64,
+) {
     for record in history.iter_mut() {
         if record.key_type == key_type && record.public_key == public_key {
             record.revoked_at = Some(now);

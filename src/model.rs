@@ -172,17 +172,12 @@ pub struct AclPolicy {
     pub rules: Vec<AclRule>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AclAction {
+    #[default]
     Allow,
     Deny,
-}
-
-impl Default for AclAction {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
