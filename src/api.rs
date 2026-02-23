@@ -1,14 +1,18 @@
+use crate::app::AppState;
 use crate::model::{
     AclAction, AclPolicy, AclSelector, AdminNodesResponse, AuditEntry, AuditLogResponse,
-    CreateNetworkRequest, CreateNetworkResponse, CreateTokenRequest, CreateTokenResponse,
+    ControlPlaneMeshPeer, ControlPlaneTopologyResponse, CreateNetworkRequest,
+    CreateNetworkResponse, CreateTokenRequest, CreateTokenResponse, DeleteNodeResponse,
     EnrollmentToken, HeartbeatRequest, HeartbeatResponse, KeyHistoryResponse, KeyPolicyResponse,
-    KeyRecord, KeyRotationPolicy, KeyRotationRequest, KeyRotationResponse, KeyType, NetMap,
-    NetworkInfo, NetworkState, NodeInfo, NodeState, PeerInfo, ProbeRequest, RegisterRequest,
-    RegisterResponse, RegisterUrlRequest, RegisterUrlResponse, RelayConfig, TokenState,
-    UpdateAclRequest, UpdateAclResponse, UpdateNodeRequest, UpdateNodeResponse,
+    KeyRecord, KeyRotationPolicy, KeyRotationRequest, KeyRotationResponse, KeyType,
+    ListTokensResponse, NetMap, NetworkInfo, NetworkState, NodeInfo, NodeState, PeerInfo,
+    ProbeRequest, RegisterRequest, RegisterResponse, RegisterUrlRequest, RegisterUrlResponse,
+    RelayConfig, TokenState, UpdateAclRequest, UpdateAclResponse, UpdateNodeRequest,
+    UpdateNodeResponse,
 };
-use crate::app::AppState;
 use crate::netid::derive_overlay_prefixes;
+use crate::state::State;
+use anyhow::Error;
 use axum::extract::{ConnectInfo, Extension, Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -17,15 +21,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rand::RngCore;
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
-use serde::Deserialize;
-use crate::state::State;
-use anyhow::Error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -88,6 +90,63 @@ fn require_admin(headers: &HeaderMap, admin_token: &Option<String>) -> Result<()
     }
 }
 
+pub async fn admin_topology(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ControlPlaneTopologyResponse>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
+    let mut control_urls = state.control_urls.clone();
+    if let Some(inferred) = infer_control_url_from_headers(&headers) {
+        if !control_urls.iter().any(|existing| existing == &inferred) {
+            control_urls.insert(0, inferred);
+        }
+    }
+    dedup_strings(&mut control_urls);
+
+    let mesh_peers = state
+        .mesh_peers
+        .iter()
+        .map(|peer| ControlPlaneMeshPeer {
+            id: peer.id.clone(),
+            addr: peer.addr.clone(),
+        })
+        .collect();
+
+    Ok(Json(ControlPlaneTopologyResponse {
+        control_urls,
+        mesh_server_id: state.mesh_server_id.clone(),
+        mesh_peers,
+        generated_at: now_unix(),
+    }))
+}
+
+fn infer_control_url_from_headers(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http");
+    let scheme = if proto.eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!("{scheme}://{}", host.trim_end_matches('/')))
+}
+
+fn dedup_strings(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
 fn require_node(
     headers: &HeaderMap,
     admin_token: &Option<String>,
@@ -116,29 +175,52 @@ pub async fn create_network(
     Json(req): Json<CreateNetworkRequest>,
 ) -> Result<Json<CreateNetworkResponse>, ApiError> {
     require_admin(&headers, &state.admin_token)?;
+    let CreateNetworkRequest {
+        name,
+        overlay_v4: requested_overlay_v4,
+        overlay_v6: requested_overlay_v6,
+        dns_domain,
+        requires_approval,
+        key_rotation_max_age_seconds,
+        bootstrap_token_ttl_seconds,
+        bootstrap_token_uses,
+        bootstrap_token_tags,
+    } = req;
+
     let network_id = Uuid::new_v4();
-    let (overlay_v4, overlay_v6) = derive_overlay_prefixes(&network_id);
-    let dns_domain = req
-        .dns_domain
-        .unwrap_or_else(|| format!("net-{}.lightscale", short_id(&network_id)));
+    let (default_overlay_v4, default_overlay_v6) = derive_overlay_prefixes(&network_id);
+    let overlay_v4 = requested_overlay_v4.unwrap_or(default_overlay_v4);
+    let overlay_v6 = requested_overlay_v6.unwrap_or(default_overlay_v6);
+    let overlay_v4_net: Ipv4Net = overlay_v4
+        .parse()
+        .map_err(|_| ApiError::BadRequest("invalid overlay_v4 cidr"))?;
+    let overlay_v6_net: Ipv6Net = overlay_v6
+        .parse()
+        .map_err(|_| ApiError::BadRequest("invalid overlay_v6 cidr"))?;
+    let next_ipv4 = initial_ipv4_offset(&overlay_v4_net).ok_or(ApiError::BadRequest(
+        "overlay_v4 must provide usable host addresses",
+    ))?;
+    let next_ipv6 = initial_ipv6_offset(&overlay_v6_net);
+    let dns_domain =
+        dns_domain.unwrap_or_else(|| format!("net-{}.lightscale", short_id(&network_id)));
     let now = now_unix();
 
     let mut bootstrap_token: Option<EnrollmentToken> = None;
 
     let network_state = NetworkState {
         id: network_id.to_string(),
-        name: req.name,
+        name,
         overlay_v4,
         overlay_v6,
         dns_domain,
-        requires_approval: req.requires_approval.unwrap_or(false),
+        requires_approval: requires_approval.unwrap_or(false),
         acl: AclPolicy::default(),
         key_policy: KeyRotationPolicy {
-            max_age_seconds: req.key_rotation_max_age_seconds,
+            max_age_seconds: key_rotation_max_age_seconds,
         },
         created_at: now,
-        next_ipv4: 10,
-        next_ipv6: 10,
+        next_ipv4,
+        next_ipv6,
     };
 
     state
@@ -146,6 +228,22 @@ pub async fn create_network(
         .write(|state| {
             if state.networks.contains_key(&network_state.id) {
                 return Err(ApiError::Conflict("network already exists").into());
+            }
+            for existing in state.networks.values() {
+                let existing_v4: Ipv4Net = existing
+                    .overlay_v4
+                    .parse()
+                    .map_err(|_| ApiError::Internal)?;
+                if ipv4_nets_overlap(&overlay_v4_net, &existing_v4) {
+                    return Err(ApiError::Conflict("overlay_v4 overlaps existing network").into());
+                }
+                let existing_v6: Ipv6Net = existing
+                    .overlay_v6
+                    .parse()
+                    .map_err(|_| ApiError::Internal)?;
+                if ipv6_nets_overlap(&overlay_v6_net, &existing_v6) {
+                    return Err(ApiError::Conflict("overlay_v6 overlaps existing network").into());
+                }
             }
             state
                 .networks
@@ -161,10 +259,10 @@ pub async fn create_network(
                 })),
             ));
 
-            if let Some(ttl) = req.bootstrap_token_ttl_seconds {
-                let uses = req.bootstrap_token_uses.unwrap_or(1);
-                let tags = req.bootstrap_token_tags.unwrap_or_default();
-                let token = build_token(&network_state.id, ttl, uses, tags)?;
+            if let Some(ttl) = bootstrap_token_ttl_seconds {
+                let uses = bootstrap_token_uses.unwrap_or(1);
+                let tags = bootstrap_token_tags.unwrap_or_default();
+                let token = build_token(&network_state.id, ttl, uses, tags, None, None, true)?;
                 state.tokens.insert(token.token.clone(), token.clone());
                 bootstrap_token = Some(token.into());
             }
@@ -196,7 +294,15 @@ pub async fn create_token(
                 .networks
                 .get(&network_id)
                 .ok_or(ApiError::NotFound("network"))?;
-            let token = build_token(&network.id, req.ttl_seconds, req.uses, req.tags)?;
+            let token = build_token(
+                &network.id,
+                req.ttl_seconds,
+                req.uses,
+                req.tags,
+                req.owner_user_id.clone(),
+                req.owner_email.clone(),
+                req.owner_is_admin.unwrap_or(true),
+            )?;
             state.tokens.insert(token.token.clone(), token.clone());
             state.audit_log.push(build_audit_entry(
                 "token.create",
@@ -206,6 +312,9 @@ pub async fn create_token(
                     "expires_at": token.expires_at,
                     "uses": token.uses_left,
                     "tags": token.tags,
+                    "owner_user_id": token.owner_user_id,
+                    "owner_email": token.owner_email,
+                    "owner_is_admin": token.owner_is_admin,
                 })),
             ));
             Ok(token)
@@ -216,6 +325,34 @@ pub async fn create_token(
     Ok(Json(CreateTokenResponse {
         token: token.into(),
     }))
+}
+
+pub async fn list_tokens(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(network_id): Path<String>,
+) -> Result<Json<ListTokensResponse>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
+    let tokens = state
+        .store
+        .read(|state| {
+            if !state.networks.contains_key(&network_id) {
+                return Err(ApiError::NotFound("network").into());
+            }
+            let mut tokens: Vec<EnrollmentToken> = state
+                .tokens
+                .values()
+                .filter(|token| token.network_id == network_id)
+                .map(EnrollmentToken::from)
+                .collect();
+            tokens.sort_by_key(|token| token.expires_at);
+            tokens.reverse();
+            Ok(tokens)
+        })
+        .await
+        .map_err(map_store_err)?;
+
+    Ok(Json(ListTokensResponse { tokens }))
 }
 
 pub async fn revoke_token(
@@ -256,13 +393,14 @@ pub async fn register(
     let now = now_unix();
     let relay = relay_or_none(&state.relay);
     let node_token = random_secret();
+    let node_name = normalize_node_name(&req.node_name)?;
 
     let node_id = state
         .store
         .write(|state| {
             let token = state
                 .tokens
-                .get_mut(&req.token)
+                .get(&req.token)
                 .ok_or(ApiError::Unauthorized("token not found"))?;
 
             if token.expires_at <= now {
@@ -276,6 +414,8 @@ pub async fn register(
             if token.uses_left == 0 {
                 return Err(ApiError::Unauthorized("token used up").into());
             }
+
+            ensure_unique_node_name(state, &token.network_id, &node_name, None)?;
 
             let network = state
                 .networks
@@ -303,13 +443,16 @@ pub async fn register(
             let node = NodeState {
                 id: node_id.clone(),
                 network_id: network.id.clone(),
-                name: req.node_name,
-                machine_public_key: req.machine_public_key,
-                wg_public_key: req.wg_public_key,
+                name: node_name.clone(),
+                machine_public_key: req.machine_public_key.clone(),
+                wg_public_key: req.wg_public_key.clone(),
                 ipv4,
                 ipv6,
                 endpoints: Vec::new(),
                 tags: token.tags.clone(),
+                owner_user_id: token.owner_user_id.clone(),
+                owner_email: token.owner_email.clone(),
+                owner_is_admin: token.owner_is_admin,
                 routes: Vec::new(),
                 created_at: now,
                 last_seen: now,
@@ -330,9 +473,16 @@ pub async fn register(
                 Some(node.id.clone()),
                 Some(serde_json::json!({
                     "approved": node.approved,
+                    "owner_user_id": node.owner_user_id,
+                    "owner_email": node.owner_email,
+                    "owner_is_admin": node.owner_is_admin,
                 })),
             ));
 
+            let token = state
+                .tokens
+                .get_mut(&req.token)
+                .ok_or(ApiError::Unauthorized("token not found"))?;
             token.uses_left = token.uses_left.saturating_sub(1);
             if token.uses_left == 0 {
                 state.tokens.remove(&req.token);
@@ -349,10 +499,7 @@ pub async fn register(
         .await
         .map_err(map_store_err)?;
 
-    Ok(Json(RegisterResponse {
-        node_token,
-        netmap,
-    }))
+    Ok(Json(RegisterResponse { node_token, netmap }))
 }
 
 pub async fn register_url(
@@ -365,11 +512,13 @@ pub async fn register_url(
         return Err(ApiError::BadRequest("ttl_seconds must be > 0"));
     }
     let expires_at = now + ttl_seconds as i64;
+    let node_name = normalize_node_name(&req.node_name)?;
 
     let node_token = random_secret();
     let (node, auth_path) = state
         .store
         .write(|state| {
+            ensure_unique_node_name(state, &req.network_id, &node_name, None)?;
             let network = state
                 .networks
                 .get_mut(&req.network_id)
@@ -396,13 +545,16 @@ pub async fn register_url(
             let node = NodeState {
                 id: node_id.clone(),
                 network_id: network.id.clone(),
-                name: req.node_name.clone(),
+                name: node_name.clone(),
                 machine_public_key: req.machine_public_key.clone(),
                 wg_public_key: req.wg_public_key.clone(),
                 ipv4,
                 ipv6,
                 endpoints: Vec::new(),
                 tags: Vec::new(),
+                owner_user_id: None,
+                owner_email: None,
+                owner_is_admin: true,
                 routes: Vec::new(),
                 created_at: now,
                 last_seen: now,
@@ -591,21 +743,27 @@ pub async fn update_node(
     let node = state
         .store
         .write(|state| {
-            let node = state
+            let existing = state
                 .nodes
-                .get_mut(&node_id)
-                .ok_or(ApiError::NotFound("node"))?;
+                .get(&node_id)
+                .ok_or(ApiError::NotFound("node"))?
+                .clone();
             let mut detail = serde_json::Map::new();
+            let mut next_name: Option<String> = None;
+            let mut next_tags: Option<Vec<String>> = None;
 
             if let Some(name) = req.name.as_ref() {
-                let trimmed = name.trim();
-                if trimmed.is_empty() {
-                    return Err(ApiError::BadRequest("node name must be non-empty").into());
+                let normalized = normalize_node_name(name)?;
+                if normalized != existing.name {
+                    ensure_unique_node_name(
+                        state,
+                        &existing.network_id,
+                        &normalized,
+                        Some(&existing.id),
+                    )?;
+                    detail.insert("name".to_string(), serde_json::json!(normalized));
+                    next_name = Some(normalized);
                 }
-                if trimmed != node.name {
-                    detail.insert("name".to_string(), serde_json::json!(trimmed));
-                }
-                node.name = trimmed.to_string();
             }
 
             if let Some(tags) = req.tags.as_ref() {
@@ -620,10 +778,21 @@ pub async fn update_node(
                         unique.push(tag.to_string());
                     }
                 }
-                if unique != node.tags {
+                if unique != existing.tags {
                     detail.insert("tags".to_string(), serde_json::json!(&unique));
+                    next_tags = Some(unique);
                 }
-                node.tags = unique;
+            }
+
+            let node = state
+                .nodes
+                .get_mut(&node_id)
+                .ok_or(ApiError::NotFound("node"))?;
+            if let Some(name) = next_name {
+                node.name = name;
+            }
+            if let Some(tags) = next_tags {
+                node.tags = tags;
             }
 
             let network_id = node.network_id.clone();
@@ -783,7 +952,12 @@ pub async fn rotate_keys(
                 if node.machine_public_key == *new_machine {
                     return Err(ApiError::BadRequest("machine_public_key unchanged").into());
                 }
-                revoke_key_record(&mut node.key_history, KeyType::Machine, &node.machine_public_key, now);
+                revoke_key_record(
+                    &mut node.key_history,
+                    KeyType::Machine,
+                    &node.machine_public_key,
+                    now,
+                );
                 node.machine_public_key = new_machine.clone();
                 node.key_history.push(KeyRecord {
                     key_type: KeyType::Machine,
@@ -798,7 +972,12 @@ pub async fn rotate_keys(
                 if node.wg_public_key == *new_wg {
                     return Err(ApiError::BadRequest("wg_public_key unchanged").into());
                 }
-                revoke_key_record(&mut node.key_history, KeyType::WireGuard, &node.wg_public_key, now);
+                revoke_key_record(
+                    &mut node.key_history,
+                    KeyType::WireGuard,
+                    &node.wg_public_key,
+                    now,
+                );
                 node.wg_public_key = new_wg.clone();
                 node.key_history.push(KeyRecord {
                     key_type: KeyType::WireGuard,
@@ -845,8 +1024,18 @@ pub async fn revoke_node(
                 .get_mut(&node_id)
                 .ok_or(ApiError::NotFound("node"))?;
             node.revoked_at = Some(now);
-            revoke_key_record(&mut node.key_history, KeyType::Machine, &node.machine_public_key, now);
-            revoke_key_record(&mut node.key_history, KeyType::WireGuard, &node.wg_public_key, now);
+            revoke_key_record(
+                &mut node.key_history,
+                KeyType::Machine,
+                &node.machine_public_key,
+                now,
+            );
+            revoke_key_record(
+                &mut node.key_history,
+                KeyType::WireGuard,
+                &node.wg_public_key,
+                now,
+            );
             state.audit_log.push(build_audit_entry(
                 "keys.revoke",
                 Some(node.network_id.clone()),
@@ -864,6 +1053,90 @@ pub async fn revoke_node(
         "node_id": node.id,
         "revoked_at": node.revoked_at,
     })))
+}
+
+pub async fn delete_node(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+) -> Result<Json<DeleteNodeResponse>, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
+    let deleted = state
+        .store
+        .write(|state| {
+            let node = state
+                .nodes
+                .remove(&node_id)
+                .ok_or(ApiError::NotFound("node"))?;
+            state.audit_log.push(build_audit_entry(
+                "node.delete",
+                Some(node.network_id.clone()),
+                Some(node.id.clone()),
+                Some(serde_json::json!({
+                    "name": node.name,
+                    "ipv4": node.ipv4,
+                    "ipv6": node.ipv6,
+                })),
+            ));
+            Ok(node.id)
+        })
+        .await
+        .map_err(map_store_err)?;
+
+    Ok(Json(DeleteNodeResponse { node_id: deleted }))
+}
+
+pub async fn delete_network(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+    Path(network_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_admin(&headers, &state.admin_token)?;
+
+    state
+        .store
+        .write(|state| {
+            // ネットワークの存在確認
+            if !state.networks.contains_key(&network_id) {
+                return Err(ApiError::NotFound("network").into());
+            }
+
+            // ネットワークに接続中のノードがあるか確認
+            let connected_nodes: Vec<_> = state
+                .nodes
+                .values()
+                .filter(|node| node.network_id == network_id)
+                .map(|node| node.id.clone())
+                .collect();
+
+            if !connected_nodes.is_empty() {
+                return Err(ApiError::Conflict(
+                    "network has connected nodes; revoke or delete nodes first",
+                )
+                .into());
+            }
+
+            // 関連するトークンを削除
+            state
+                .tokens
+                .retain(|_, token| token.network_id != network_id);
+
+            // ネットワークを削除
+            state.networks.remove(&network_id);
+
+            state.audit_log.push(build_audit_entry(
+                "network.delete",
+                Some(network_id.clone()),
+                None,
+                None,
+            ));
+
+            Ok(())
+        })
+        .await
+        .map_err(map_store_err)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn node_keys(
@@ -954,8 +1227,7 @@ pub async fn heartbeat(
         routes,
         probe,
     } = req;
-    let observed_endpoint = listen_port
-        .map(|port| SocketAddr::new(remote.ip(), port).to_string());
+    let observed_endpoint = listen_port.map(|port| SocketAddr::new(remote.ip(), port).to_string());
     let endpoints = merge_endpoints(endpoints, observed_endpoint);
 
     state
@@ -1049,10 +1321,7 @@ fn build_netmap(
     node_id: &str,
     relay: Option<RelayConfig>,
 ) -> Result<NetMap, ApiError> {
-    let node = state
-        .nodes
-        .get(node_id)
-        .ok_or(ApiError::NotFound("node"))?;
+    let node = state.nodes.get(node_id).ok_or(ApiError::NotFound("node"))?;
     let network = state
         .networks
         .get(&node.network_id)
@@ -1064,7 +1333,7 @@ fn build_netmap(
             &network.id,
             network.dns_domain.as_str(),
             &state.nodes,
-            Some(&node.id),
+            Some(&node_id),
             node,
             &network.acl,
             &network.key_policy,
@@ -1094,11 +1363,7 @@ fn build_netmap(
 
 const PROBE_TTL_SECONDS: i64 = 30;
 
-fn collect_probe_requests(
-    state: &State,
-    peers: &[PeerInfo],
-    now: i64,
-) -> Vec<ProbeRequest> {
+fn collect_probe_requests(state: &State, peers: &[PeerInfo], now: i64) -> Vec<ProbeRequest> {
     peers
         .iter()
         .filter_map(|peer| {
@@ -1197,7 +1462,8 @@ fn acl_allows(policy: &AclPolicy, src: &NodeState, dst: &NodeState) -> bool {
 }
 
 fn selector_matches(node: &NodeState, selector: &AclSelector) -> bool {
-    let empty = selector.tags.is_empty() && selector.node_ids.is_empty() && selector.names.is_empty();
+    let empty =
+        selector.tags.is_empty() && selector.node_ids.is_empty() && selector.names.is_empty();
     if selector.any || empty {
         return true;
     }
@@ -1213,6 +1479,38 @@ fn selector_matches(node: &NodeState, selector: &AclSelector) -> bool {
         .any(|tag| node.tags.iter().any(|node_tag| node_tag == tag))
 }
 
+fn normalize_node_name(name: &str) -> Result<String, ApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest("node name must be non-empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn ensure_unique_node_name(
+    state: &State,
+    network_id: &str,
+    name: &str,
+    exclude_node_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let conflict = state.nodes.values().any(|node| {
+        if node.network_id != network_id {
+            return false;
+        }
+        if node.revoked_at.is_some() {
+            return false;
+        }
+        if exclude_node_id.is_some_and(|id| node.id == id) {
+            return false;
+        }
+        node.name.eq_ignore_ascii_case(name)
+    });
+    if conflict {
+        return Err(ApiError::Conflict("node name already exists"));
+    }
+    Ok(())
+}
+
 fn relay_or_none(relay: &RelayConfig) -> Option<RelayConfig> {
     if relay.stun_servers.is_empty()
         && relay.turn_servers.is_empty()
@@ -1225,10 +1523,35 @@ fn relay_or_none(relay: &RelayConfig) -> Option<RelayConfig> {
     }
 }
 
-fn build_token(network_id: &str, ttl_seconds: u64, uses: u32, tags: Vec<String>) -> Result<TokenState, ApiError> {
+fn build_token(
+    network_id: &str,
+    ttl_seconds: u64,
+    uses: u32,
+    tags: Vec<String>,
+    owner_user_id: Option<String>,
+    owner_email: Option<String>,
+    owner_is_admin: bool,
+) -> Result<TokenState, ApiError> {
     if ttl_seconds == 0 || uses == 0 {
         return Err(ApiError::BadRequest("ttl_seconds and uses must be > 0"));
     }
+
+    let owner_user_id = owner_user_id.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let owner_email = owner_email.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
 
     let token = random_secret();
     let expires_at = now_unix() + ttl_seconds as i64;
@@ -1239,6 +1562,9 @@ fn build_token(network_id: &str, ttl_seconds: u64, uses: u32, tags: Vec<String>)
         expires_at,
         uses_left: uses,
         tags,
+        owner_user_id,
+        owner_email,
+        owner_is_admin,
         revoked_at: None,
     })
 }
@@ -1249,17 +1575,68 @@ fn random_secret() -> String {
     URL_SAFE_NO_PAD.encode(random)
 }
 
-fn allocate_node_ips(network: &mut NetworkState) -> Result<(String, String), ApiError> {
-    let v4_net: Ipv4Net = network
-        .overlay_v4
-        .parse()
-        .map_err(|_| ApiError::Internal)?;
-    let v6_net: Ipv6Net = network
-        .overlay_v6
-        .parse()
-        .map_err(|_| ApiError::Internal)?;
+fn ipv4_nets_overlap(a: &Ipv4Net, b: &Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
 
-    if network.next_ipv4 > 250 {
+fn ipv6_nets_overlap(a: &Ipv6Net, b: &Ipv6Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
+
+fn initial_ipv4_offset(net: &Ipv4Net) -> Option<u32> {
+    let max = max_ipv4_offset(net)?;
+    if max >= 10 {
+        Some(10)
+    } else if max >= 1 {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn max_ipv4_offset(net: &Ipv4Net) -> Option<u32> {
+    let prefix_len = net.prefix_len();
+    if prefix_len >= 31 {
+        return None;
+    }
+    let host_bits = (32 - prefix_len) as u32;
+    let total = 1u64 << host_bits;
+    let last_usable = total.saturating_sub(2);
+    u32::try_from(last_usable).ok()
+}
+
+fn initial_ipv6_offset(net: &Ipv6Net) -> u128 {
+    let max = max_ipv6_offset(net);
+    if max >= 10 {
+        10
+    } else if max >= 1 {
+        1
+    } else {
+        0
+    }
+}
+
+fn max_ipv6_offset(net: &Ipv6Net) -> u128 {
+    let host_bits = (128 - net.prefix_len()) as u32;
+    if host_bits == 128 {
+        u128::MAX
+    } else if host_bits == 0 {
+        0
+    } else {
+        (1u128 << host_bits) - 1
+    }
+}
+
+fn allocate_node_ips(network: &mut NetworkState) -> Result<(String, String), ApiError> {
+    let v4_net: Ipv4Net = network.overlay_v4.parse().map_err(|_| ApiError::Internal)?;
+    let v6_net: Ipv6Net = network.overlay_v6.parse().map_err(|_| ApiError::Internal)?;
+
+    let Some(max_ipv4) = max_ipv4_offset(&v4_net) else {
+        return Err(ApiError::Conflict(
+            "ipv4 subnet has no usable host addresses",
+        ));
+    };
+    if network.next_ipv4 > max_ipv4 {
         return Err(ApiError::Conflict("ipv4 address space exhausted"));
     }
 
@@ -1267,6 +1644,10 @@ fn allocate_node_ips(network: &mut NetworkState) -> Result<(String, String), Api
     let ip4 = Ipv4Addr::from(base_v4 + network.next_ipv4);
     network.next_ipv4 += 1;
 
+    let max_ipv6 = max_ipv6_offset(&v6_net);
+    if network.next_ipv6 > max_ipv6 {
+        return Err(ApiError::Conflict("ipv6 address space exhausted"));
+    }
     let base_v6 = u128::from(v6_net.network());
     let ip6 = Ipv6Addr::from(base_v6 + network.next_ipv6);
     network.next_ipv6 += 1;
@@ -1332,6 +1713,9 @@ mod tests {
             ipv6: "fd00::1".to_string(),
             endpoints: Vec::new(),
             tags,
+            owner_user_id: Some(format!("user-{}", name)),
+            owner_email: Some(format!("{}@example.test", name)),
+            owner_is_admin: false,
             routes: Vec::new(),
             created_at,
             last_seen: created_at,
@@ -1398,5 +1782,65 @@ mod tests {
         let (approved, required) = effective_node_status(&node, &policy, now);
         assert!(!approved);
         assert!(required);
+    }
+
+    fn sample_network(overlay_v4: &str, overlay_v6: &str) -> NetworkState {
+        let v4_net: Ipv4Net = overlay_v4.parse().expect("valid v4 cidr");
+        let v6_net: Ipv6Net = overlay_v6.parse().expect("valid v6 cidr");
+        NetworkState {
+            id: "net-1".to_string(),
+            name: "net".to_string(),
+            overlay_v4: overlay_v4.to_string(),
+            overlay_v6: overlay_v6.to_string(),
+            dns_domain: "net.test".to_string(),
+            requires_approval: false,
+            acl: AclPolicy::default(),
+            key_policy: KeyRotationPolicy {
+                max_age_seconds: None,
+            },
+            created_at: 0,
+            next_ipv4: initial_ipv4_offset(&v4_net).unwrap_or(0),
+            next_ipv6: initial_ipv6_offset(&v6_net),
+        }
+    }
+
+    #[test]
+    fn initial_offsets_follow_subnet_size() {
+        let v4_large: Ipv4Net = "100.64.0.0/24".parse().unwrap();
+        let v4_small: Ipv4Net = "100.64.0.0/30".parse().unwrap();
+        let v4_tiny: Ipv4Net = "100.64.0.0/31".parse().unwrap();
+        let v6_large: Ipv6Net = "fd00::/48".parse().unwrap();
+        let v6_small: Ipv6Net = "fd00::/128".parse().unwrap();
+
+        assert_eq!(initial_ipv4_offset(&v4_large), Some(10));
+        assert_eq!(initial_ipv4_offset(&v4_small), Some(1));
+        assert_eq!(initial_ipv4_offset(&v4_tiny), None);
+        assert_eq!(initial_ipv6_offset(&v6_large), 10);
+        assert_eq!(initial_ipv6_offset(&v6_small), 0);
+    }
+
+    #[test]
+    fn ipv4_allocator_respects_configured_cidr_bounds() {
+        let mut network = sample_network("100.64.0.0/30", "fd00::/126");
+
+        let (ip1, _) = allocate_node_ips(&mut network).unwrap();
+        let (ip2, _) = allocate_node_ips(&mut network).unwrap();
+        assert_eq!(ip1, "100.64.0.1");
+        assert_eq!(ip2, "100.64.0.2");
+
+        let exhausted = allocate_node_ips(&mut network);
+        assert!(matches!(
+            exhausted,
+            Err(ApiError::Conflict("ipv4 address space exhausted"))
+        ));
+    }
+
+    #[test]
+    fn cidr_overlap_detection_works() {
+        let a: Ipv4Net = "100.64.0.0/24".parse().unwrap();
+        let b: Ipv4Net = "100.64.0.128/25".parse().unwrap();
+        let c: Ipv4Net = "100.65.0.0/24".parse().unwrap();
+        assert!(ipv4_nets_overlap(&a, &b));
+        assert!(!ipv4_nets_overlap(&a, &c));
     }
 }

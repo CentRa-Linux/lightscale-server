@@ -17,6 +17,9 @@ sqlx = { version = "0.8", features = ["json", "postgres", "runtime-tokio-rustls"
 thiserror = "1"
 time = { version = "0.3", features = ["serde", "formatting"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }

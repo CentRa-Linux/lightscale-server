@@ -1,9 +1,10 @@
+use crate::mesh::{MeshIncomingPacket, MeshOutgoingPacket, MeshTransport};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::warn;
 
@@ -22,7 +23,9 @@ struct Peer {
 }
 
 enum RelayPacket {
-    Register { node_id: String },
+    Register {
+        node_id: String,
+    },
     Send {
         from_id: String,
         to_id: String,
@@ -30,14 +33,26 @@ enum RelayPacket {
     },
 }
 
-pub async fn run(listen: SocketAddr) -> Result<()> {
-    let socket = UdpSocket::bind(listen)
-        .await
-        .map_err(|err| anyhow!("udp relay bind failed: {}", err))?;
+pub async fn run_with_mesh(
+    listen: SocketAddr,
+    mesh_tx: Option<mpsc::UnboundedSender<MeshOutgoingPacket>>,
+    mesh_rx: Option<mpsc::UnboundedReceiver<MeshIncomingPacket>>,
+) -> Result<()> {
+    let socket = Arc::new(
+        UdpSocket::bind(listen)
+            .await
+            .map_err(|err| anyhow!("udp relay bind failed: {}", err))?,
+    );
     let peers: Arc<RwLock<HashMap<String, Peer>>> = Arc::new(RwLock::new(HashMap::new()));
 
     let cleanup_peers = peers.clone();
     tokio::spawn(async move { cleanup_loop(cleanup_peers).await });
+
+    if let Some(mesh_rx) = mesh_rx {
+        let peers = peers.clone();
+        let socket = socket.clone();
+        tokio::spawn(async move { handle_mesh_deliveries(mesh_rx, socket, peers).await });
+    }
 
     let mut buf = vec![0u8; 2048];
     loop {
@@ -63,21 +78,73 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
                 payload,
             } => {
                 upsert_peer(&peers, from_id.clone(), addr).await;
-                let target = peers.read().await.get(&to_id).cloned();
-                if let Some(peer) = target {
-                    let deliver = build_packet(TYPE_DELIVER, &from_id, "", &payload)?;
-                    if let Err(err) = socket.send_to(&deliver, peer.addr).await {
-                        warn!("udp relay send failed: {}", err);
+                let delivered = deliver_local(&socket, &peers, &from_id, &to_id, &payload).await?;
+                if !delivered {
+                    if let Some(mesh_tx) = mesh_tx.as_ref() {
+                        let _ = mesh_tx.send(MeshOutgoingPacket {
+                            transport: MeshTransport::Udp,
+                            from_id,
+                            to_id,
+                            payload,
+                        });
+                    } else {
+                        warn!("udp relay: unknown target {}", to_id);
                     }
-                } else {
-                    warn!("udp relay: unknown target {}", to_id);
                 }
             }
         }
     }
 }
 
-async fn upsert_peer(peers: &Arc<RwLock<HashMap<String, Peer>>>, node_id: String, addr: SocketAddr) {
+async fn handle_mesh_deliveries(
+    mut mesh_rx: mpsc::UnboundedReceiver<MeshIncomingPacket>,
+    socket: Arc<UdpSocket>,
+    peers: Arc<RwLock<HashMap<String, Peer>>>,
+) {
+    while let Some(incoming) = mesh_rx.recv().await {
+        let MeshIncomingPacket {
+            transport,
+            from_id,
+            to_id,
+            payload,
+            delivered,
+        } = incoming;
+        if transport != MeshTransport::Udp {
+            let _ = delivered.send(false);
+            continue;
+        }
+        let result = deliver_local(&socket, &peers, &from_id, &to_id, &payload).await;
+        let delivered_flag = matches!(result, Ok(true));
+        let _ = delivered.send(delivered_flag);
+    }
+}
+
+async fn deliver_local(
+    socket: &Arc<UdpSocket>,
+    peers: &Arc<RwLock<HashMap<String, Peer>>>,
+    from_id: &str,
+    to_id: &str,
+    payload: &[u8],
+) -> Result<bool> {
+    let target = peers.read().await.get(to_id).cloned();
+    if let Some(peer) = target {
+        let deliver = build_packet(TYPE_DELIVER, from_id, "", payload)?;
+        if let Err(err) = socket.send_to(&deliver, peer.addr).await {
+            warn!("udp relay send failed: {}", err);
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+async fn upsert_peer(
+    peers: &Arc<RwLock<HashMap<String, Peer>>>,
+    node_id: String,
+    addr: SocketAddr,
+) {
     let mut guard = peers.write().await;
     guard.insert(
         node_id,
@@ -116,8 +183,12 @@ fn parse_packet(buf: &[u8]) -> Option<RelayPacket> {
     }
     let from_end = offset + from_len;
     let to_end = from_end + to_len;
-    let from_id = std::str::from_utf8(&buf[offset..from_end]).ok()?.to_string();
-    let to_id = std::str::from_utf8(&buf[from_end..to_end]).ok()?.to_string();
+    let from_id = std::str::from_utf8(&buf[offset..from_end])
+        .ok()?
+        .to_string();
+    let to_id = std::str::from_utf8(&buf[from_end..to_end])
+        .ok()?
+        .to_string();
     let payload = buf[to_end..].to_vec();
 
     match msg_type {

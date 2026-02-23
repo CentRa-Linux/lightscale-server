@@ -29,6 +29,12 @@ pub struct NodeState {
     pub ipv6: String,
     pub endpoints: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub owner_is_admin: bool,
     pub routes: Vec<Route>,
     #[serde(default)]
     pub created_at: i64,
@@ -58,6 +64,12 @@ pub struct TokenState {
     pub expires_at: i64,
     pub uses_left: u32,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub owner_is_admin: bool,
     #[serde(default)]
     pub revoked_at: Option<i64>,
 }
@@ -101,6 +113,12 @@ pub struct NodeInfo {
     pub machine_public_key: String,
     pub endpoints: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub owner_is_admin: bool,
     pub routes: Vec<Route>,
     pub last_seen: i64,
     pub approved: bool,
@@ -225,12 +243,20 @@ pub struct EnrollmentToken {
     pub expires_at: i64,
     pub uses_left: u32,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub owner_is_admin: bool,
     pub revoked_at: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CreateNetworkRequest {
     pub name: String,
+    pub overlay_v4: Option<String>,
+    pub overlay_v6: Option<String>,
     pub dns_domain: Option<String>,
     pub requires_approval: Option<bool>,
     pub key_rotation_max_age_seconds: Option<u64>,
@@ -250,11 +276,22 @@ pub struct CreateTokenRequest {
     pub ttl_seconds: u64,
     pub uses: u32,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
+    #[serde(default)]
+    pub owner_email: Option<String>,
+    #[serde(default)]
+    pub owner_is_admin: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CreateTokenResponse {
     pub token: EnrollmentToken,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ListTokensResponse {
+    pub tokens: Vec<EnrollmentToken>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -299,6 +336,11 @@ pub struct KeyRotationResponse {
     pub node_id: String,
     pub machine_public_key: String,
     pub wg_public_key: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DeleteNodeResponse {
+    pub node_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -372,6 +414,22 @@ pub struct HeartbeatResponse {
     pub netmap: NetMap,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ControlPlaneMeshPeer {
+    pub id: String,
+    pub addr: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ControlPlaneTopologyResponse {
+    pub control_urls: Vec<String>,
+    #[serde(default)]
+    pub mesh_server_id: Option<String>,
+    #[serde(default)]
+    pub mesh_peers: Vec<ControlPlaneMeshPeer>,
+    pub generated_at: i64,
+}
+
 impl From<&NetworkState> for NetworkInfo {
     fn from(state: &NetworkState) -> Self {
         Self {
@@ -387,7 +445,12 @@ impl From<&NetworkState> for NetworkInfo {
 }
 
 impl NodeInfo {
-    pub fn from_state(node: &NodeState, dns_domain: &str, approved: bool, key_rotation_required: bool) -> Self {
+    pub fn from_state(
+        node: &NodeState,
+        dns_domain: &str,
+        approved: bool,
+        key_rotation_required: bool,
+    ) -> Self {
         Self {
             id: node.id.clone(),
             name: node.name.clone(),
@@ -398,6 +461,9 @@ impl NodeInfo {
             machine_public_key: node.machine_public_key.clone(),
             endpoints: node.endpoints.clone(),
             tags: node.tags.clone(),
+            owner_user_id: node.owner_user_id.clone(),
+            owner_email: node.owner_email.clone(),
+            owner_is_admin: node.owner_is_admin,
             routes: node.routes.clone(),
             last_seen: node.last_seen,
             approved,
@@ -431,6 +497,9 @@ impl From<TokenState> for EnrollmentToken {
             expires_at: token.expires_at,
             uses_left: token.uses_left,
             tags: token.tags,
+            owner_user_id: token.owner_user_id,
+            owner_email: token.owner_email,
+            owner_is_admin: token.owner_is_admin,
             revoked_at: token.revoked_at,
         }
     }
@@ -443,6 +512,9 @@ impl From<&TokenState> for EnrollmentToken {
             expires_at: token.expires_at,
             uses_left: token.uses_left,
             tags: token.tags.clone(),
+            owner_user_id: token.owner_user_id.clone(),
+            owner_email: token.owner_email.clone(),
+            owner_is_admin: token.owner_is_admin,
             revoked_at: token.revoked_at,
         }
     }

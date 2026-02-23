@@ -1,8 +1,9 @@
+use crate::mesh::{MeshIncomingPacket, MeshOutgoingPacket, MeshTransport};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
@@ -25,7 +26,9 @@ struct PeerConn {
 }
 
 enum RelayPacket {
-    Register { node_id: String },
+    Register {
+        node_id: String,
+    },
     Send {
         from_id: String,
         to_id: String,
@@ -33,12 +36,22 @@ enum RelayPacket {
     },
 }
 
-pub async fn run(listen: SocketAddr) -> Result<()> {
+pub async fn run_with_mesh(
+    listen: SocketAddr,
+    mesh_tx: Option<mpsc::UnboundedSender<MeshOutgoingPacket>>,
+    mesh_rx: Option<mpsc::UnboundedReceiver<MeshIncomingPacket>>,
+) -> Result<()> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|err| anyhow!("stream relay bind failed: {}", err))?;
-    let peers: Arc<RwLock<HashMap<String, Vec<PeerConn>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let peers: Arc<RwLock<HashMap<String, Vec<PeerConn>>>> = Arc::new(RwLock::new(HashMap::new()));
+
+    if let Some(mesh_rx) = mesh_rx {
+        let peers = peers.clone();
+        tokio::spawn(async move {
+            handle_mesh_deliveries(mesh_rx, peers).await;
+        });
+    }
 
     loop {
         let (stream, _) = listener
@@ -46,8 +59,9 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
             .await
             .map_err(|err| anyhow!("stream relay accept failed: {}", err))?;
         let peers = peers.clone();
+        let mesh_tx = mesh_tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, peers).await {
+            if let Err(err) = handle_connection(stream, peers, mesh_tx).await {
                 warn!("stream relay connection error: {}", err);
             }
         });
@@ -57,6 +71,7 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
 async fn handle_connection(
     stream: TcpStream,
     peers: Arc<RwLock<HashMap<String, Vec<PeerConn>>>>,
+    mesh_tx: Option<mpsc::UnboundedSender<MeshOutgoingPacket>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -80,10 +95,10 @@ async fn handle_connection(
 
     {
         let mut guard = peers.write().await;
-        guard
-            .entry(node_id.clone())
-            .or_default()
-            .push(PeerConn { id: conn_id, sender: tx });
+        guard.entry(node_id.clone()).or_default().push(PeerConn {
+            id: conn_id,
+            sender: tx,
+        });
     }
 
     loop {
@@ -108,11 +123,17 @@ async fn handle_connection(
                     warn!("stream relay: spoofed from_id {} for {}", from_id, node_id);
                     continue;
                 }
-                let targets = peers.read().await.get(&to_id).cloned();
-                if let Some(targets) = targets {
-                    let deliver = build_packet(TYPE_DELIVER, &from_id, "", &payload)?;
-                    for target in targets {
-                        let _ = target.sender.send(deliver.clone());
+                let delivered = deliver_local(&peers, &from_id, &to_id, &payload).await?;
+                if !delivered {
+                    if let Some(mesh_tx) = mesh_tx.as_ref() {
+                        let _ = mesh_tx.send(MeshOutgoingPacket {
+                            transport: MeshTransport::Stream,
+                            from_id,
+                            to_id,
+                            payload,
+                        });
+                    } else {
+                        warn!("stream relay: unknown target {}", to_id);
                     }
                 }
             }
@@ -132,6 +153,44 @@ async fn handle_connection(
     Ok(())
 }
 
+async fn handle_mesh_deliveries(
+    mut mesh_rx: mpsc::UnboundedReceiver<MeshIncomingPacket>,
+    peers: Arc<RwLock<HashMap<String, Vec<PeerConn>>>>,
+) {
+    while let Some(incoming) = mesh_rx.recv().await {
+        let MeshIncomingPacket {
+            transport: _,
+            from_id,
+            to_id,
+            payload,
+            delivered,
+        } = incoming;
+        let result = deliver_local(&peers, &from_id, &to_id, &payload).await;
+        let delivered_flag = matches!(result, Ok(true));
+        let _ = delivered.send(delivered_flag);
+    }
+}
+
+async fn deliver_local(
+    peers: &Arc<RwLock<HashMap<String, Vec<PeerConn>>>>,
+    from_id: &str,
+    to_id: &str,
+    payload: &[u8],
+) -> Result<bool> {
+    let targets = peers.read().await.get(to_id).cloned();
+    let Some(targets) = targets else {
+        return Ok(false);
+    };
+    let deliver = build_packet(TYPE_DELIVER, from_id, "", payload)?;
+    let mut sent_any = false;
+    for target in targets {
+        if target.sender.send(deliver.clone()).is_ok() {
+            sent_any = true;
+        }
+    }
+    Ok(sent_any)
+}
+
 async fn read_frame(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -144,10 +203,7 @@ async fn read_frame(reader: &mut tokio::net::tcp::OwnedReadHalf) -> Result<Vec<u
     Ok(buf)
 }
 
-async fn write_frame(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    body: &[u8],
-) -> Result<()> {
+async fn write_frame(writer: &mut tokio::net::tcp::OwnedWriteHalf, body: &[u8]) -> Result<()> {
     if body.is_empty() || body.len() > MAX_FRAME_LEN {
         return Err(anyhow!("invalid frame length {}", body.len()));
     }
@@ -176,8 +232,12 @@ fn parse_packet(buf: &[u8]) -> Option<RelayPacket> {
     }
     let from_end = offset + from_len;
     let to_end = from_end + to_len;
-    let from_id = std::str::from_utf8(&buf[offset..from_end]).ok()?.to_string();
-    let to_id = std::str::from_utf8(&buf[from_end..to_end]).ok()?.to_string();
+    let from_id = std::str::from_utf8(&buf[offset..from_end])
+        .ok()?
+        .to_string();
+    let to_id = std::str::from_utf8(&buf[from_end..to_end])
+        .ok()?
+        .to_string();
     let payload = buf[to_end..].to_vec();
 
     match msg_type {

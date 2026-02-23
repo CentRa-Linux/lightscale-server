@@ -141,11 +141,18 @@ async fn persist_file(path: Option<&Path>, state: State) -> Result<()> {
 
 async fn init_db(pool: &PgPool) -> Result<()> {
     const INIT_LOCK_KEY: i64 = 0x4c53434c;
+    let is_cockroach = sqlx::query_scalar::<_, String>("SELECT version()")
+        .fetch_one(pool)
+        .await
+        .map(|v| v.contains("CockroachDB"))
+        .unwrap_or(false);
     let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(INIT_LOCK_KEY)
-        .execute(&mut *tx)
-        .await?;
+    if !is_cockroach {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(INIT_LOCK_KEY)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS lightscale_state (id INT PRIMARY KEY, state JSONB NOT NULL)",
     )
