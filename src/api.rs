@@ -1516,6 +1516,7 @@ fn relay_or_none(relay: &RelayConfig) -> Option<RelayConfig> {
         && relay.turn_servers.is_empty()
         && relay.stream_relay_servers.is_empty()
         && relay.udp_relay_servers.is_empty()
+        && relay.dns_servers.is_empty()
     {
         None
     } else {

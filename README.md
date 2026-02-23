@@ -40,6 +40,7 @@ cargo run -- --listen 0.0.0.0:8080 --state ./state.json \
   --turn turn.example.com:3478 \
   --stream-relay relay.example.com:443 \
   --udp-relay relay.example.com:3478 \
+  --dns-listen 0.0.0.0:53 \
   --udp-relay-listen 0.0.0.0:3478 \
   --stream-relay-listen 0.0.0.0:443
 ```
@@ -47,6 +48,10 @@ cargo run -- --listen 0.0.0.0:8080 --state ./state.json \
 These values are surfaced in the netmap for clients. A minimal UDP relay is available when
 `--udp-relay-listen` is set, and a minimal stream relay is available with
 `--stream-relay-listen`. For TURN, run an external TURN server and advertise it via `--turn`.
+When `--dns-listen` is set, the server also runs an authoritative DNS responder for Lightscale
+network domains. `--dns-server` is optional and controls advertised DNS endpoints; when omitted,
+the server derives endpoints from `--control-url` hosts + the `--dns-listen` port. DNS endpoint
+values accept `HOST` or `HOST:PORT` (port omitted => `53`).
 
 ## Server Mesh Relay (mTLS)
 

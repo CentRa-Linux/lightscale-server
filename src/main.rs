@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod dns;
 mod mesh;
 mod model;
 mod netid;
@@ -45,10 +46,14 @@ struct Args {
     stream_relay: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     udp_relay: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    dns_server: Vec<String>,
     #[arg(long)]
     udp_relay_listen: Option<String>,
     #[arg(long)]
     stream_relay_listen: Option<String>,
+    #[arg(long)]
+    dns_listen: Option<String>,
     #[arg(long)]
     mesh_server_id: Option<String>,
     #[arg(long)]
@@ -98,13 +103,16 @@ async fn main() -> anyhow::Result<()> {
         StateStore::load(Some(args.state.clone())).await?
     };
     let mesh_config = build_mesh_config(&args)?;
+    let control_urls = normalize_control_urls(&args.control_url)?;
+    let dns_servers =
+        resolve_dns_servers(&args.dns_server, args.dns_listen.as_deref(), &control_urls)?;
     let relay = RelayConfig {
         stun_servers: args.stun,
         turn_servers: args.turn,
         stream_relay_servers: args.stream_relay,
         udp_relay_servers: args.udp_relay,
+        dns_servers,
     };
-    let control_urls = normalize_control_urls(&args.control_url)?;
     let mesh_peer_meta: Vec<MeshPeerMeta> = parse_mesh_peers(&args.mesh_peer)?
         .into_iter()
         .map(|peer| MeshPeerMeta {
@@ -182,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/heartbeat", post(heartbeat))
         .route("/v1/netmap/:node_id", get(netmap))
         .route("/v1/netmap/:node_id/longpoll", get(netmap_longpoll))
-        .layer(axum::Extension(app_state));
+        .layer(axum::Extension(app_state.clone()));
 
     let addr: SocketAddr = args.listen.parse()?;
     tracing::info!("listening on {}", addr);
@@ -190,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let udp_relay_listen = args.udp_relay_listen.clone();
     let stream_relay_listen = args.stream_relay_listen.clone();
+    let dns_listen = args.dns_listen.clone();
 
     if let Some(listen) = udp_relay_listen.clone() {
         let udp_addr: SocketAddr = listen.parse()?;
@@ -217,6 +226,17 @@ async fn main() -> anyhow::Result<()> {
 
     if mesh_config.is_some() && stream_relay_listen.is_none() && udp_relay_listen.is_none() {
         tracing::warn!("mesh configured but neither stream nor udp relay listener is enabled");
+    }
+
+    if let Some(listen) = dns_listen {
+        let dns_addr: SocketAddr = listen.parse()?;
+        let store = app_state.store.clone();
+        tokio::spawn(async move {
+            if let Err(err) = dns::run(dns_addr, store).await {
+                tracing::error!("dns server error: {}", err);
+            }
+        });
+        tracing::info!("dns server listening on {}", dns_addr);
     }
 
     axum::serve(
@@ -328,4 +348,183 @@ fn normalize_control_urls(values: &[String]) -> anyhow::Result<Vec<String>> {
     urls.sort();
     urls.dedup();
     Ok(urls)
+}
+
+fn resolve_dns_servers(
+    explicit: &[String],
+    dns_listen: Option<&str>,
+    control_urls: &[String],
+) -> anyhow::Result<Vec<String>> {
+    if !explicit.is_empty() {
+        return normalize_dns_server_values(explicit.to_vec());
+    }
+    let Some(listen_raw) = dns_listen else {
+        return Ok(Vec::new());
+    };
+    let listen_addr: SocketAddr = listen_raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --dns-listen value {}", listen_raw))?;
+    let mut values = Vec::new();
+    for control_url in control_urls {
+        if let Some(host) = extract_control_url_host(control_url) {
+            values.push(format_host_port(&host, listen_addr.port()));
+        }
+    }
+    if values.is_empty() && !listen_addr.ip().is_unspecified() {
+        values.push(listen_addr.to_string());
+    }
+    normalize_dns_server_values(values)
+}
+
+fn normalize_dns_server_values(values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in values {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (host, port) = split_host_port(trimmed).map_err(|_| anyhow::anyhow!(
+            "invalid dns server value {}; expected HOST[:PORT] (IPv6 with port must use [addr]:port)",
+            trimmed
+        ))?;
+        out.push(format_host_port(&host, port));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+const DEFAULT_DNS_PORT: u16 = 53;
+
+fn extract_control_url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        return Some(authority[1..end].to_string());
+    }
+    if let Some((host, _port)) = authority.rsplit_once(':') {
+        if !host.is_empty() {
+            return Some(host.to_string());
+        }
+    }
+    Some(authority.to_string())
+}
+
+fn split_host_port(value: &str) -> anyhow::Result<(String, u16)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow::anyhow!("missing host"));
+    }
+
+    if let Some(stripped) = value.strip_prefix('[') {
+        let (host, rest) = stripped
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("missing closing bracket"))?;
+        if rest.is_empty() {
+            return Ok((host.to_string(), DEFAULT_DNS_PORT));
+        }
+        if let Some(port_raw) = rest.strip_prefix(':') {
+            let port: u16 = port_raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid port"))?;
+            return Ok((host.to_string(), port));
+        }
+        return Err(anyhow::anyhow!("invalid bracketed host"));
+    }
+
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Ok((ip.to_string(), DEFAULT_DNS_PORT));
+    }
+
+    if let Some((host, port_raw)) = value.rsplit_once(':') {
+        if host.is_empty() {
+            return Err(anyhow::anyhow!("missing host"));
+        }
+        if host.contains(':') {
+            return Err(anyhow::anyhow!(
+                "IPv6 addresses with port must be bracketed"
+            ));
+        }
+        let port: u16 = port_raw
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid port"))?;
+        return Ok((host.to_string(), port));
+    }
+
+    Ok((value.to_string(), DEFAULT_DNS_PORT))
+}
+
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        extract_control_url_host, normalize_dns_server_values, resolve_dns_servers, split_host_port,
+    };
+
+    #[test]
+    fn split_host_port_defaults_to_53_when_port_omitted() {
+        assert_eq!(
+            split_host_port("dns.example.com").expect("split dns host"),
+            ("dns.example.com".to_string(), 53)
+        );
+        assert_eq!(
+            split_host_port("[2001:db8::10]").expect("split dns v6"),
+            ("2001:db8::10".to_string(), 53)
+        );
+    }
+
+    #[test]
+    fn split_host_port_rejects_invalid_unbracketed_ipv6_with_port_like_suffix() {
+        assert!(split_host_port("2001:db8::10:70000").is_err());
+    }
+
+    #[test]
+    fn normalize_dns_server_values_deduplicates_values() {
+        let values = normalize_dns_server_values(vec![
+            "dns.example.com".to_string(),
+            "dns.example.com:53".to_string(),
+            "[2001:db8::1]".to_string(),
+            "[2001:db8::1]:53".to_string(),
+        ])
+        .expect("normalize dns values");
+        assert_eq!(
+            values,
+            vec![
+                "[2001:db8::1]:53".to_string(),
+                "dns.example.com:53".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_dns_servers_derives_from_control_url_and_listen() {
+        let values = resolve_dns_servers(
+            &[],
+            Some("0.0.0.0:5353"),
+            &["https://control.example.com".to_string()],
+        )
+        .expect("resolve dns servers");
+        assert_eq!(values, vec!["control.example.com:5353".to_string()]);
+    }
+
+    #[test]
+    fn extract_control_url_host_handles_ipv6_url() {
+        assert_eq!(
+            extract_control_url_host("https://[2001:db8::10]:8443"),
+            Some("2001:db8::10".to_string())
+        );
+    }
 }

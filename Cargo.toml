@@ -9,6 +9,7 @@ axum = { version = "0.7", features = ["json"] }
 base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
+hickory-proto = "0.24"
 ipnet = "2"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

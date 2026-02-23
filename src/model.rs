@@ -235,6 +235,8 @@ pub struct RelayConfig {
     pub stream_relay_servers: Vec<String>,
     #[serde(default)]
     pub udp_relay_servers: Vec<String>,
+    #[serde(default)]
+    pub dns_servers: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
